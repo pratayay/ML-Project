@@ -12,26 +12,136 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Any
 
 REGISTRY_PATH = Path(__file__).with_name("drift_threshold_registry.yaml")
 
-# Mirror the registry to avoid adding a yaml dependency.
-THRESHOLD_REGISTRY: dict[str, dict[str, float]] = {
-    "risk_mean_shift": {"warning": 0.08, "critical": 0.15},
-    "category_shift": {"warning": 0.12, "critical": 0.20},
-    "psi": {"warning": 0.20, "critical": 0.35},
-    "kl_divergence": {"warning": 0.10, "critical": 0.20},
-}
+_FLOAT_PATTERN = re.compile(r"^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$")
 
-ALERT_DESTINATIONS: dict[str, list[str]] = {
-    "warning": ["slack:#ml-ops-alerts", "pagerduty:ml-risk-warning"],
-    "critical": [
-        "slack:#incident-ml-platform",
-        "pagerduty:ml-risk-critical",
-        "email:ml-oncall@example.com",
-    ],
-}
+
+def _strip_yaml_comment(line: str) -> str:
+    for index, char in enumerate(line):
+        if char == "#" and (index == 0 or line[index - 1].isspace()):
+            return line[:index].rstrip()
+    return line.rstrip()
+
+
+def _parse_yaml_scalar(value: str) -> Any:
+    stripped = value.strip()
+    if stripped in {"", "null", "~"}:
+        return None
+    if _FLOAT_PATTERN.match(stripped):
+        return float(stripped)
+    return stripped
+
+
+def _load_registry_config(path: Path) -> tuple[dict[str, dict[str, float]], dict[str, list[str]]]:
+    """Load threshold and alert routing configuration from YAML registry."""
+    if not path.exists():
+        raise ValueError(f"Registry file does not exist: {path}")
+
+    data: dict[str, Any] = {}
+    stack: list[tuple[int, Any]] = [(-1, data)]
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        without_comment = _strip_yaml_comment(line)
+        if not without_comment.strip():
+            continue
+
+        indent = len(without_comment) - len(without_comment.lstrip(" "))
+        content = without_comment.strip()
+
+        while len(stack) > 1 and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+
+        if content.startswith("- "):
+            if not isinstance(parent, list):
+                raise ValueError(f"Invalid YAML list entry in registry: {line}")
+            parent.append(_parse_yaml_scalar(content[2:]))
+            continue
+
+        key, sep, remainder = content.partition(":")
+        if not sep:
+            raise ValueError(f"Invalid YAML line in registry: {line}")
+
+        key = key.strip()
+        value_text = remainder.strip()
+        if value_text == "":
+            next_container: Any
+            if key == "alert_destinations":
+                next_container = []
+            else:
+                next_container = {}
+            if not isinstance(parent, dict):
+                raise ValueError(f"Invalid YAML mapping structure in registry: {line}")
+            parent[key] = next_container
+            stack.append((indent, next_container))
+        else:
+            if not isinstance(parent, dict):
+                raise ValueError(f"Invalid YAML scalar structure in registry: {line}")
+            parent[key] = _parse_yaml_scalar(value_text)
+
+    signals = data.get("signals")
+    if not isinstance(signals, dict) or not signals:
+        raise ValueError("Registry must define a non-empty 'signals' mapping")
+
+    severity_levels = data.get("severity_levels")
+    if not isinstance(severity_levels, dict) or not severity_levels:
+        raise ValueError("Registry must define a non-empty 'severity_levels' mapping")
+
+    threshold_registry: dict[str, dict[str, float]] = {}
+    for signal_name, signal_config in signals.items():
+        if not isinstance(signal_config, dict):
+            raise ValueError(f"Signal '{signal_name}' configuration must be a mapping")
+
+        if "warning" not in signal_config or "critical" not in signal_config:
+            raise ValueError(
+                f"Signal '{signal_name}' must include both 'warning' and 'critical' thresholds"
+            )
+
+        warning = signal_config["warning"]
+        critical = signal_config["critical"]
+        if not isinstance(warning, float | int) or not isinstance(critical, float | int):
+            raise ValueError(
+                f"Signal '{signal_name}' warning/critical thresholds must be numeric"
+            )
+
+        warning_float = float(warning)
+        critical_float = float(critical)
+        if warning_float > critical_float:
+            raise ValueError(
+                f"Signal '{signal_name}' must satisfy warning <= critical"
+            )
+
+        threshold_registry[signal_name] = {
+            "warning": warning_float,
+            "critical": critical_float,
+        }
+
+    alert_destinations: dict[str, list[str]] = {}
+    for level_name, level_config in severity_levels.items():
+        if not isinstance(level_config, dict):
+            raise ValueError(f"Severity level '{level_name}' configuration must be a mapping")
+
+        destinations = level_config.get("alert_destinations")
+        if not isinstance(destinations, list):
+            raise ValueError(
+                f"Severity level '{level_name}' must include an 'alert_destinations' list"
+            )
+
+        if not all(isinstance(destination, str) for destination in destinations):
+            raise ValueError(
+                f"Severity level '{level_name}' alert destinations must be strings"
+            )
+
+        alert_destinations[level_name] = destinations
+
+    return threshold_registry, alert_destinations
+
+
+THRESHOLD_REGISTRY, ALERT_DESTINATIONS = _load_registry_config(REGISTRY_PATH)
 
 
 

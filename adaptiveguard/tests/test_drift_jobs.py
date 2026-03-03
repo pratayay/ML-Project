@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sqlite3
 from pathlib import Path
 
@@ -14,6 +15,18 @@ def _load_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+
+def test_registry_backed_configuration_is_loaded() -> None:
+    drift_jobs = _load_module()
+
+    assert drift_jobs.THRESHOLD_REGISTRY["risk_mean_shift"] == {"warning": 0.08, "critical": 0.15}
+    assert drift_jobs.ALERT_DESTINATIONS["warning"] == [
+        "slack:#ml-ops-alerts",
+        "pagerduty:ml-risk-warning",
+    ]
+
 
 
 def test_warning_drift_writes_events_and_shadow_eval() -> None:
@@ -42,8 +55,12 @@ def test_warning_drift_writes_events_and_shadow_eval() -> None:
 
         shadow_count = conn.execute("SELECT COUNT(*) FROM shadow_evaluations").fetchone()[0]
         ticket_count = conn.execute("SELECT COUNT(*) FROM retraining_tickets").fetchone()[0]
+        alert_destinations = conn.execute(
+            "SELECT alert_destinations FROM drift_events LIMIT 1"
+        ).fetchone()[0]
         assert shadow_count == 1
         assert ticket_count == 0
+        assert json.loads(alert_destinations) == drift_jobs.ALERT_DESTINATIONS["warning"]
 
 
 def test_critical_drift_triggers_all_auto_actions() -> None:
