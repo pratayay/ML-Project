@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -33,6 +34,8 @@ ALERT_DESTINATIONS: dict[str, list[str]] = {
     ],
 }
 
+logger = logging.getLogger(__name__)
+
 
 
 def utc_now() -> str:
@@ -42,7 +45,9 @@ def utc_now() -> str:
 
 def evaluate_severity(signal_name: str, value: float) -> str | None:
     """Return warning/critical when threshold is met, otherwise None."""
-    thresholds = THRESHOLD_REGISTRY[signal_name]
+    thresholds = THRESHOLD_REGISTRY.get(signal_name)
+    if thresholds is None:
+        return None
     if value >= thresholds["critical"]:
         return "critical"
     if value >= thresholds["warning"]:
@@ -177,6 +182,19 @@ def run_drift_job(
     highest_severity = None
 
     for signal_name, value in signal_values.items():
+        if signal_name not in THRESHOLD_REGISTRY:
+            logger.warning(
+                "unknown_drift_signal",
+                extra={
+                    "diagnostics": {
+                        "signal_name": signal_name,
+                        "signal_value": value,
+                        "known_signals": sorted(THRESHOLD_REGISTRY),
+                    }
+                },
+            )
+            continue
+
         severity = evaluate_severity(signal_name, value)
         if severity is None:
             continue
