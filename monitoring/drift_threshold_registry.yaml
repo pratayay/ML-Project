@@ -1,0 +1,33 @@
+version: 1
+owner: ml-ops
+signals:
+  risk_mean_shift:
+    description: Absolute change in mean risk score vs baseline.
+    warning: 0.08
+    critical: 0.15
+    comparison: gte
+  category_shift:
+    description: Total variation distance between categorical distributions.
+    warning: 0.12
+    critical: 0.2
+    comparison: gte
+  psi:
+    description: Population Stability Index for score bucket drift.
+    warning: 0.2
+    critical: 0.35
+    comparison: gte
+  kl_divergence:
+    description: KL divergence between baseline and current score distributions.
+    warning: 0.1
+    critical: 0.2
+    comparison: gte
+severity_levels:
+  warning:
+    alert_destinations:
+      - slack:#ml-ops-alerts
+      - pagerduty:ml-risk-warning
+  critical:
+    alert_destinations:
+      - slack:#incident-ml-platform
+      - pagerduty:ml-risk-critical
+      - email:ml-oncall@example.com
