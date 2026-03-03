@@ -108,6 +108,50 @@ def test_warning_and_critical_transitions_trigger_expected_actions() -> None:
         assert drift_count == 5
 
 
+def test_mixed_known_and_unknown_signals_are_handled_gracefully(caplog) -> None:
+    drift_jobs = _load_module()
+    caplog.set_level("WARNING")
+
+    with _sqlite_storage(drift_jobs) as storage:
+        events = drift_jobs.run_drift_job(
+            storage,
+            model_name="risk_model",
+            model_version="v1",
+            signal_values={
+                "risk_mean_shift": 0.09,
+                "unknown_signal": 0.99,
+                "psi": 0.05,
+            },
+        )
+
+        assert len(events) == 1
+        assert events[0]["signal_name"] == "risk_mean_shift"
+        assert events[0]["severity"] == "warning"
+
+        inserted_signals = storage.execute(
+            "SELECT signal_name FROM drift_events ORDER BY id"
+        ).fetchall()
+        assert inserted_signals == [("risk_mean_shift",)]
+
+        shadow_count = storage.execute("SELECT COUNT(*) FROM shadow_evaluations").fetchone()[0]
+        ticket_count = storage.execute("SELECT COUNT(*) FROM retraining_tickets").fetchone()[0]
+        assert shadow_count == 1
+        assert ticket_count == 0
+
+        diagnostics_rows = storage.execute(
+            "SELECT diagnostics_json FROM drift_events ORDER BY id"
+        ).fetchall()
+        assert all("unknown_signal" not in row[0] for row in diagnostics_rows)
+
+    unknown_signal_logs = [
+        rec
+        for rec in caplog.records
+        if rec.message == "unknown_drift_signal"
+        and getattr(rec, "diagnostics", {}).get("signal_name") == "unknown_signal"
+    ]
+    assert len(unknown_signal_logs) == 1
+
+
 def test_missing_required_registry_signal_fails_without_fallback(monkeypatch) -> None:
     drift_jobs = _load_module()
 

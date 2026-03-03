@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -23,6 +24,9 @@ REQUIRED_SIGNALS = (
     "kl_divergence",
 )
 REQUIRED_THRESHOLD_KEYS = ("warning", "critical")
+
+
+logger = logging.getLogger(__name__)
 
 
 class Storage:
@@ -80,7 +84,6 @@ def connect_storage(db_target: str) -> Storage:
 
     conn = sqlite3.connect(db_target)
     return Storage(conn, backend="sqlite")
-
 
 def utc_now() -> str:
     """Return a UTC timestamp in ISO 8601 format."""
@@ -200,7 +203,9 @@ def validate_registry(registry: dict[str, Any]) -> None:
 
 def evaluate_severity(signal_name: str, value: float, threshold_registry: dict[str, dict[str, float]]) -> str | None:
     """Return warning/critical when threshold is met, otherwise None."""
-    thresholds = threshold_registry[signal_name]
+    thresholds = threshold_registry.get(signal_name)
+    if thresholds is None:
+        return None
     if value >= thresholds["critical"]:
         return "critical"
     if value >= thresholds["warning"]:
@@ -338,6 +343,19 @@ def run_drift_job(
     highest_severity = None
 
     for signal_name, value in signal_values.items():
+        if signal_name not in registry["signals"]:
+            logger.warning(
+                "unknown_drift_signal",
+                extra={
+                    "diagnostics": {
+                        "signal_name": signal_name,
+                        "signal_value": value,
+                        "known_signals": sorted(registry["signals"]),
+                    }
+                },
+            )
+            continue
+
         severity = evaluate_severity(signal_name, value, registry["signals"])
         if severity is None:
             continue
