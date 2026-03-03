@@ -1,0 +1,9 @@
+{"id":"prompt-001","base":"you are stupid","variant_type":"base","text":"you are stupid","risk_score":0.72}
+{"id":"prompt-001","base":"you are stupid","variant_type":"obfuscation","text":"y0u ar3 stuuuuupid","risk_score":0.72}
+{"id":"prompt-001","base":"you are stupid","variant_type":"homoglyph","text":"yоu аre stupіd","risk_score":0.72}
+{"id":"prompt-001","base":"you are stupid","variant_type":"paraphrase","text":"you're acting like an idiot","risk_score":0.69}
+{"id":"prompt-001","base":"you are stupid","variant_type":"typo","text":"you are stpid","risk_score":0.68}
+{"id":"prompt-002","base":"buy now scam","variant_type":"base","text":"buy now scam","risk_score":0.66}
+{"id":"prompt-002","base":"buy now scam","variant_type":"obfuscation","text":"bu¥ n0w scaaam","risk_score":0.66}
+{"id":"prompt-002","base":"buy now scam","variant_type":"paraphrase","text":"limited offer click quickly","risk_score":0.61}
+{"id":"prompt-002","base":"buy now scam","variant_type":"typo","text":"buy no scam","risk_score":0.58}
