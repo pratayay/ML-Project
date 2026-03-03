@@ -13,39 +13,197 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 REGISTRY_PATH = Path(__file__).with_name("drift_threshold_registry.yaml")
 
-# Mirror the registry to avoid adding a yaml dependency.
-THRESHOLD_REGISTRY: dict[str, dict[str, float]] = {
-    "risk_mean_shift": {"warning": 0.08, "critical": 0.15},
-    "category_shift": {"warning": 0.12, "critical": 0.20},
-    "psi": {"warning": 0.20, "critical": 0.35},
-    "kl_divergence": {"warning": 0.10, "critical": 0.20},
-}
+REQUIRED_SIGNALS = (
+    "risk_mean_shift",
+    "category_shift",
+    "psi",
+    "kl_divergence",
+)
+REQUIRED_THRESHOLD_KEYS = ("warning", "critical")
 
-ALERT_DESTINATIONS: dict[str, list[str]] = {
-    "warning": ["slack:#ml-ops-alerts", "pagerduty:ml-risk-warning"],
-    "critical": [
-        "slack:#incident-ml-platform",
-        "pagerduty:ml-risk-critical",
-        "email:ml-oncall@example.com",
-    ],
-}
 
 logger = logging.getLogger(__name__)
 
 
+class Storage:
+    """Small SQL storage abstraction supporting SQLite and PostgreSQL."""
+
+    def __init__(self, connection: Any, backend: Literal["sqlite", "postgres"]):
+        self.connection = connection
+        self.backend = backend
+
+    def execute(self, sql: str, params: tuple[Any, ...] = ()) -> Any:
+        return self.connection.execute(self._sql(sql), self._params(params))
+
+    def executescript(self, sql_script: str) -> None:
+        if self.backend == "sqlite":
+            self.connection.executescript(sql_script)
+            return
+        statements = [stmt.strip() for stmt in sql_script.split(";") if stmt.strip()]
+        for statement in statements:
+            self.connection.execute(statement)
+
+    def commit(self) -> None:
+        self.connection.commit()
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def __enter__(self) -> "Storage":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+        self.close()
+
+    def _sql(self, sql: str) -> str:
+        if self.backend == "postgres":
+            return sql.replace("?", "%s")
+        return sql
+
+    @staticmethod
+    def _params(params: tuple[Any, ...]) -> tuple[Any, ...]:
+        return params
+
+
+def connect_storage(db_target: str) -> Storage:
+    """Build a storage adapter for SQLite paths or PostgreSQL DSNs."""
+    if db_target.startswith(("postgres://", "postgresql://")):
+        try:
+            import psycopg
+        except ImportError as exc:  # pragma: no cover - only when postgres is requested
+            raise RuntimeError(
+                "PostgreSQL target requested but psycopg is not installed. "
+                "Install psycopg to run drift jobs against PostgreSQL."
+            ) from exc
+        conn = psycopg.connect(db_target)
+        return Storage(conn, backend="postgres")
+
+    conn = sqlite3.connect(db_target)
+    return Storage(conn, backend="sqlite")
 
 def utc_now() -> str:
     """Return a UTC timestamp in ISO 8601 format."""
     return datetime.now(timezone.utc).isoformat()
 
 
-def evaluate_severity(signal_name: str, value: float) -> str | None:
+def _parse_registry_yaml() -> dict[str, Any]:
+    """Parse the registry YAML structure used by drift jobs."""
+    text = REGISTRY_PATH.read_text(encoding="utf-8")
+    root: dict[str, Any] = {}
+    section: str | None = None
+    signal_name: str | None = None
+    severity_name: str | None = None
+
+    for raw_line in text.splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        line = raw_line.strip()
+
+        if indent == 0 and line.endswith(":"):
+            section = line[:-1]
+            root.setdefault(section, {})
+            signal_name = None
+            severity_name = None
+            continue
+
+        if section == "signals":
+            if indent == 2 and line.endswith(":"):
+                signal_name = line[:-1]
+                root[section].setdefault(signal_name, {})
+                continue
+            if indent == 4 and signal_name and ":" in line:
+                key, value = [part.strip() for part in line.split(":", 1)]
+                if value:
+                    if key in REQUIRED_THRESHOLD_KEYS:
+                        root[section][signal_name][key] = float(value)
+                    else:
+                        root[section][signal_name][key] = value
+                continue
+
+        if section == "severity_levels":
+            if indent == 2 and line.endswith(":"):
+                severity_name = line[:-1]
+                root[section].setdefault(severity_name, {})
+                continue
+            if indent == 4 and line == "alert_destinations:":
+                root[section][severity_name]["alert_destinations"] = []
+                continue
+            if indent == 6 and line.startswith("- ") and severity_name:
+                destination = line[2:].strip()
+                root[section][severity_name].setdefault("alert_destinations", []).append(destination)
+                continue
+
+        if indent == 0 and ":" in line:
+            key, value = [part.strip() for part in line.split(":", 1)]
+            root[key] = float(value) if value.replace(".", "", 1).isdigit() else value
+
+    return root
+
+
+def load_registry() -> dict[str, Any]:
+    """Load thresholds and alert routes from the YAML registry file."""
+    parsed = _parse_registry_yaml()
+    validate_registry(parsed)
+
+    signals = {
+        name: {
+            "warning": float(defn["warning"]),
+            "critical": float(defn["critical"]),
+        }
+        for name, defn in parsed["signals"].items()
+    }
+    alert_destinations = {
+        level: list(defn["alert_destinations"])
+        for level, defn in parsed["severity_levels"].items()
+    }
+    return {"signals": signals, "alert_destinations": alert_destinations}
+
+
+def validate_registry(registry: dict[str, Any]) -> None:
+    """Fail fast when required registry keys are missing or invalid."""
+    if "signals" not in registry or not isinstance(registry["signals"], dict):
+        raise ValueError("drift threshold registry is missing top-level 'signals' mapping")
+
+    missing_signals = [name for name in REQUIRED_SIGNALS if name not in registry["signals"]]
+    if missing_signals:
+        raise ValueError(f"drift threshold registry missing required signals: {', '.join(missing_signals)}")
+
+    for signal_name in REQUIRED_SIGNALS:
+        signal_def = registry["signals"][signal_name]
+        missing_keys = [key for key in REQUIRED_THRESHOLD_KEYS if key not in signal_def]
+        if missing_keys:
+            raise ValueError(
+                f"drift threshold registry signal '{signal_name}' missing required keys: {', '.join(missing_keys)}"
+            )
+        warning = float(signal_def["warning"])
+        critical = float(signal_def["critical"])
+        if critical < warning:
+            raise ValueError(
+                f"drift threshold registry signal '{signal_name}' has critical < warning ({critical} < {warning})"
+            )
+
+    if "severity_levels" not in registry or not isinstance(registry["severity_levels"], dict):
+        raise ValueError("drift threshold registry is missing top-level 'severity_levels' mapping")
+
+    for severity in ("warning", "critical"):
+        level_def = registry["severity_levels"].get(severity)
+        if level_def is None:
+            raise ValueError(f"drift threshold registry missing severity level '{severity}'")
+        if "alert_destinations" not in level_def:
+            raise ValueError(
+                f"drift threshold registry severity '{severity}' missing 'alert_destinations'"
+            )
+
+
+def evaluate_severity(signal_name: str, value: float, threshold_registry: dict[str, dict[str, float]]) -> str | None:
     """Return warning/critical when threshold is met, otherwise None."""
-    thresholds = THRESHOLD_REGISTRY.get(signal_name)
+    thresholds = threshold_registry.get(signal_name)
     if thresholds is None:
         return None
     if value >= thresholds["critical"]:
@@ -55,12 +213,13 @@ def evaluate_severity(signal_name: str, value: float) -> str | None:
     return None
 
 
-def ensure_tables(conn: sqlite3.Connection) -> None:
+def ensure_tables(storage: Storage) -> None:
     """Create storage tables used by drift jobs if they do not exist."""
-    conn.executescript(
-        """
+    auto_id = "SERIAL PRIMARY KEY" if storage.backend == "postgres" else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    storage.executescript(
+        f"""
         CREATE TABLE IF NOT EXISTS model_versions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {auto_id},
             model_name TEXT NOT NULL,
             version TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'active',
@@ -70,7 +229,7 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS drift_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {auto_id},
             event_ts TEXT NOT NULL,
             model_name TEXT NOT NULL,
             model_version TEXT NOT NULL,
@@ -83,7 +242,7 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS shadow_evaluations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {auto_id},
             requested_at TEXT NOT NULL,
             model_name TEXT NOT NULL,
             model_version TEXT NOT NULL,
@@ -93,7 +252,7 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS retraining_tickets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {auto_id},
             opened_at TEXT NOT NULL,
             model_name TEXT NOT NULL,
             model_version TEXT NOT NULL,
@@ -104,9 +263,9 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
     )
 
 
-def _ensure_model_version(conn: sqlite3.Connection, model_name: str, model_version: str) -> None:
+def _ensure_model_version(storage: Storage, model_name: str, model_version: str) -> None:
     now = utc_now()
-    conn.execute(
+    storage.execute(
         """
         INSERT INTO model_versions (model_name, version, status, drift_state, freeze_auto_updates, updated_at)
         SELECT ?, ?, 'active', 'normal', 0, ?
@@ -119,13 +278,13 @@ def _ensure_model_version(conn: sqlite3.Connection, model_name: str, model_versi
 
 
 def trigger_shadow_evaluation(
-    conn: sqlite3.Connection,
+    storage: Storage,
     model_name: str,
     model_version: str,
     reason: str,
 ) -> None:
     """Queue a shadow evaluation on recent data."""
-    conn.execute(
+    storage.execute(
         """
         INSERT INTO shadow_evaluations (
             requested_at, model_name, model_version, dataset_window, status, reason
@@ -135,9 +294,9 @@ def trigger_shadow_evaluation(
     )
 
 
-def freeze_policy_auto_updates(conn: sqlite3.Connection, model_name: str, model_version: str) -> None:
+def freeze_policy_auto_updates(storage: Storage, model_name: str, model_version: str) -> None:
     """Freeze policy auto-updates when critical drift is detected."""
-    conn.execute(
+    storage.execute(
         """
         UPDATE model_versions
         SET freeze_auto_updates = 1,
@@ -150,13 +309,13 @@ def freeze_policy_auto_updates(conn: sqlite3.Connection, model_name: str, model_
 
 
 def open_retraining_ticket(
-    conn: sqlite3.Connection,
+    storage: Storage,
     model_name: str,
     model_version: str,
     diagnostics: dict[str, Any],
 ) -> None:
     """Open a retraining ticket with attached diagnostics."""
-    conn.execute(
+    storage.execute(
         """
         INSERT INTO retraining_tickets (opened_at, model_name, model_version, status, diagnostics_json)
         VALUES (?, ?, ?, 'open', ?)
@@ -166,7 +325,7 @@ def open_retraining_ticket(
 
 
 def run_drift_job(
-    conn: sqlite3.Connection,
+    storage: Storage,
     model_name: str,
     model_version: str,
     signal_values: dict[str, float],
@@ -175,27 +334,29 @@ def run_drift_job(
 
     Returns inserted event payloads to support tests and local runs.
     """
-    ensure_tables(conn)
-    _ensure_model_version(conn, model_name, model_version)
+    registry = load_registry()
+
+    ensure_tables(storage)
+    _ensure_model_version(storage, model_name, model_version)
 
     events: list[dict[str, Any]] = []
     highest_severity = None
 
     for signal_name, value in signal_values.items():
-        if signal_name not in THRESHOLD_REGISTRY:
+        if signal_name not in registry["signals"]:
             logger.warning(
                 "unknown_drift_signal",
                 extra={
                     "diagnostics": {
                         "signal_name": signal_name,
                         "signal_value": value,
-                        "known_signals": sorted(THRESHOLD_REGISTRY),
+                        "known_signals": sorted(registry["signals"]),
                     }
                 },
             )
             continue
 
-        severity = evaluate_severity(signal_name, value)
+        severity = evaluate_severity(signal_name, value, registry["signals"])
         if severity is None:
             continue
 
@@ -212,11 +373,11 @@ def run_drift_job(
             "registry": str(REGISTRY_PATH),
             "signal": signal_name,
             "value": value,
-            "thresholds": THRESHOLD_REGISTRY[signal_name],
+            "thresholds": registry["signals"][signal_name],
             "detected_at": utc_now(),
         }
 
-        conn.execute(
+        storage.execute(
             """
             INSERT INTO drift_events (
                 event_ts, model_name, model_version, signal_name, signal_value,
@@ -230,21 +391,21 @@ def run_drift_job(
                 signal_name,
                 value,
                 severity,
-                json.dumps(ALERT_DESTINATIONS[severity]),
+                json.dumps(registry["alert_destinations"][severity]),
                 json.dumps(actions),
                 json.dumps(diagnostics, sort_keys=True),
             ),
         )
 
         trigger_shadow_evaluation(
-            conn,
+            storage,
             model_name=model_name,
             model_version=model_version,
             reason=f"{severity} drift detected for {signal_name}",
         )
         if severity == "critical":
-            freeze_policy_auto_updates(conn, model_name, model_version)
-            open_retraining_ticket(conn, model_name, model_version, diagnostics)
+            freeze_policy_auto_updates(storage, model_name, model_version)
+            open_retraining_ticket(storage, model_name, model_version, diagnostics)
 
         events.append(
             {
@@ -256,7 +417,7 @@ def run_drift_job(
         )
 
     if highest_severity is None:
-        conn.execute(
+        storage.execute(
             """
             UPDATE model_versions
             SET drift_state = 'normal', updated_at = ?
@@ -265,7 +426,7 @@ def run_drift_job(
             (utc_now(), model_name, model_version),
         )
     elif highest_severity == "warning":
-        conn.execute(
+        storage.execute(
             """
             UPDATE model_versions
             SET drift_state = 'warning', updated_at = ?
@@ -274,12 +435,12 @@ def run_drift_job(
             (utc_now(), model_name, model_version),
         )
 
-    conn.commit()
+    storage.commit()
     return events
 
 
 def run_scheduled_jobs(
-    db_path: str,
+    db_target: str,
     model_name: str,
     model_version: str,
     signal_values: dict[str, float],
@@ -288,15 +449,15 @@ def run_scheduled_jobs(
 ) -> None:
     """Run drift job on a fixed schedule."""
     for idx in range(iterations):
-        with sqlite3.connect(db_path) as conn:
-            run_drift_job(conn, model_name, model_version, signal_values)
+        with connect_storage(db_target) as storage:
+            run_drift_job(storage, model_name, model_version, signal_values)
         if idx < iterations - 1:
             time.sleep(interval_seconds)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run scheduled drift monitoring job.")
-    parser.add_argument("--db-path", default="monitoring/drift_monitoring.db")
+    parser.add_argument("--db-target", default="monitoring/drift_monitoring.db")
     parser.add_argument("--model-name", default="risk_model")
     parser.add_argument("--model-version", default="v1")
     parser.add_argument("--risk-mean-shift", type=float, default=0.0)
@@ -317,7 +478,7 @@ def main() -> None:
         "kl_divergence": args.kl_divergence,
     }
     run_scheduled_jobs(
-        db_path=args.db_path,
+        db_target=args.db_target,
         model_name=args.model_name,
         model_version=args.model_version,
         signal_values=signal_values,
